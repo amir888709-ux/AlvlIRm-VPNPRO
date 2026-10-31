@@ -1,1 +1,136 @@
+name: Build AlvlIRm VPN APK
 
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project zip (if present)
+        run: |
+          if [ -f alvlirm_vpn_pro.zip ]; then
+            mkdir _src
+            unzip -q alvlirm_vpn_pro.zip -d _src
+            cp -r _src/alvlirm_vpn_pro/. .
+            rm -rf _src
+          fi
+
+      - name: Check secrets
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          [ -n "$APP_KEY" ] || echo "::warning::APP_KEY secret is not set - using a default key (weak protection). Add it in Settings > Secrets > Actions."
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "::warning::SUPABASE_URL / SUPABASE_KEY not set - remote server updates and online counter are disabled."
+          fi
+
+      - name: Encrypt seed servers
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+        run: |
+          python3 -c "import cryptography" 2>/dev/null || pip install --break-system-packages cryptography || pip install cryptography
+          python3 tools/encrypt_seed.py
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Signing key (stable across builds)
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          PASS="${KEYSTORE_PASSWORD:-AlvlIRm@VPN2026}"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.keystore
+            echo "using keystore from secret"
+          elif [ -f release.keystore ]; then
+            echo "using keystore from repository"
+          else
+            keytool -genkeypair -v -keystore release.keystore -storetype PKCS12 \
+              -alias alvlirm -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=AlvlIRm VPN, O=AlvlIRm, C=IR"
+            git config user.name "github-actions"
+            git config user.email "actions@users.noreply.github.com"
+            git add release.keystore
+            git commit -m "Add release signing key [skip ci]" || true
+            git push || echo "::warning::could not push keystore; updates may need uninstall first"
+          fi
+
+      - name: Create Android project
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          flutter create --platforms=android --org com.alvlirm --project-name alvlirm_vpn _tmp
+          cp -r _tmp/android ./android
+          rm -rf _tmp
+          F=android/app/build.gradle.kts
+          [ -f "$F" ] || F=android/app/build.gradle
+          sed -i 's/minSdk = .*/minSdk = 24/; s/minSdkVersion .*/minSdkVersion 24/' "$F"
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' "$M"
+          sed -i 's|android:label="[^"]*"|android:label="AlvlIRm VPN"|' "$M"
+          cp release.keystore android/app/release.keystore
+          if [[ "$F" == *.kts ]]; then
+            cat tools/signing.kts.txt >> "$F"
+          else
+            cat tools/signing.gradle.txt >> "$F"
+          fi
+          cp -r icons/. android/app/src/main/res/
+
+      - name: Build APKs
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          export KS_PASS_EFFECTIVE="${KEYSTORE_PASSWORD:-AlvlIRm@VPN2026}"
+          flutter pub get
+          flutter build apk --release --split-per-abi \
+            --obfuscate --split-debug-info=build/symbols \
+            --dart-define=APP_KEY="$APP_KEY" \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_KEY="$SUPABASE_KEY"
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk AlvlIRm-VPN-arm64.apk
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk AlvlIRm-VPN-arm32.apk
+
+      - name: Verify APKs
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          for f in AlvlIRm-VPN-*.apk; do
+            echo "=== $f"
+            ls -l "$f"
+            "$BT/apksigner" verify --verbose --print-certs "$f" | head -8 || true
+            "$BT/aapt2" dump badging "$f" | grep -E "^package|sdkVersion|native-code" || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AlvlIRm-VPN-apks
+          path: AlvlIRm-VPN-*.apk
+
+      - name: Publish release (direct APK download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.2.${{ github.run_number }}
+          name: AlvlIRm VPN v1.2.${{ github.run_number }}
+          body: "اکثر گوشی‌ها: AlvlIRm-VPN-arm64.apk — گوشی‌های قدیمی: AlvlIRm-VPN-arm32.apk"
+          files: |
+            AlvlIRm-VPN-arm64.apk
+            AlvlIRm-VPN-arm32.apk
