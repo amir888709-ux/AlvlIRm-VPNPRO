@@ -93,6 +93,9 @@ jobs:
           fi
           cp -r icons/. android/app/src/main/res/
 
+      - name: Add Aether (MASQUE-in-MASQUE) binaries
+        run: python3 tools/fetch_aether.py android
+
       - name: Build APKs
         env:
           APP_KEY: ${{ secrets.APP_KEY }}
@@ -118,6 +121,7 @@ jobs:
             ls -l "$f"
             "$BT/apksigner" verify --verbose --print-certs "$f" | head -8 || true
             "$BT/aapt2" dump badging "$f" | grep -E "^package|sdkVersion|native-code" || true
+            unzip -l "$f" | grep -i "libaether" || echo "::warning::libaether.so not found in $f"
           done
 
       - uses: actions/upload-artifact@v4
@@ -134,4 +138,3 @@ jobs:
           files: |
             AlvlIRm-VPN-arm64.apk
             AlvlIRm-VPN-arm32.apk
-            
